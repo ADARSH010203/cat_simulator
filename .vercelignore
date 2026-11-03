@@ -1,0 +1,22 @@
+# Vercel uploads everything not ignored — keep it to the app source only
+node_modules
+.next
+out
+db
+scripts
+upload
+tool-results
+download
+examples
+tests
+mini-services
+.zscripts
+skills
+.env
+.env.*
+!.env.example
+dev.log
+server.log
+worklog.md
+Caddyfile
+bun.lockb

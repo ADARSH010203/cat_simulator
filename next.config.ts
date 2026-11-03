@@ -1,13 +1,15 @@
 import type { NextConfig } from "next";
 
-// GitHub Pages build (workflow sets DEPLOY_TARGET=pages):
-// static export into ./out, served from https://<user>.github.io/cat_simulator/
-const isPages = process.env.DEPLOY_TARGET === "pages";
+// Build targets:
+//   DEPLOY_TARGET=pages    -> static export for GitHub Pages (basePath /cat_simulator)
+//   DEPLOY_TARGET=selfhost -> standalone server output for self-hosting
+//   default (Vercel/cloud) -> no output override
+const target = process.env.DEPLOY_TARGET;
 
 const nextConfig: NextConfig = {
-  // standalone for self-hosting, export for GitHub Pages
-  output: isPages ? "export" : "standalone",
-  ...(isPages && {
+  ...(target === "selfhost" && { output: "standalone" as const }),
+  ...(target === "pages" && {
+    output: "export" as const,
     basePath: "/cat_simulator",
     images: { unoptimized: true },
     trailingSlash: true,

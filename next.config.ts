@@ -1,7 +1,17 @@
 import type { NextConfig } from "next";
 
+// GitHub Pages build (workflow sets DEPLOY_TARGET=pages):
+// static export into ./out, served from https://<user>.github.io/cat_simulator/
+const isPages = process.env.DEPLOY_TARGET === "pages";
+
 const nextConfig: NextConfig = {
-  output: "standalone",
+  // standalone for self-hosting, export for GitHub Pages
+  output: isPages ? "export" : "standalone",
+  ...(isPages && {
+    basePath: "/cat_simulator",
+    images: { unoptimized: true },
+    trailingSlash: true,
+  }),
   typescript: {
     ignoreBuildErrors: true,
   },

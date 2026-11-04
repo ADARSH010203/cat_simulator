@@ -168,6 +168,10 @@ export class VoiceController {
   private pcmTotal = 0;
   private pcmSampleRate = 0;
   private starting = false;
+  /** release received while the mic was still opening (permission prompt) */
+  private stopRequested = false;
+  /** AudioWorklet module: registered once per page, reused across sessions */
+  private workletState: 'idle' | 'loading' | 'ready' | 'failed' = 'idle';
   /** bumped on every stop/cancel — lets a pending start abort cleanly */
   private startSeq = 0;
   private vad = new Vad();
@@ -221,6 +225,7 @@ export class VoiceController {
   cancelAll(): void {
     this.startSeq++; // abort any start still waiting on the permission prompt
     this.starting = false;
+    this.stopRequested = false;
     this.stopVadLoop();
     this.disarmListenGuard();
     this.stopRecognition();
@@ -284,6 +289,9 @@ export class VoiceController {
       micError = 'The microphone is busy in another app — close it and try again.';
     }
     useCatLive.getState().setLive({ permission, micError, micBlockedByFrame, micRequesting: false });
+    // surface outside the Voice tab too — a silent mic failure otherwise
+    // reads as "the cat doesn't repeat me"
+    this.onError?.(micError);
   }
 
   private releaseMic(): void {
@@ -295,6 +303,7 @@ export class VoiceController {
 
   async startListening(handsfree: boolean): Promise<void> {
     if (this.state === 'Listening' || this.state === 'Processing' || this.starting) return;
+    this.stopRequested = false; // a stale release from an aborted start must not leak
     this.starting = true;
     const seq = ++this.startSeq;
     this.armStartWatchdog(seq);
@@ -339,8 +348,14 @@ export class VoiceController {
       return;
     }
 
+    // The button was released while the mic was still opening — on a fresh
+    // browser the very first attempt dies right here (the permission prompt
+    // steals the press, the release aborts the start, nothing is echoed).
+    // Convert the session to hands-free instead so the user can simply talk.
+    const promptRecovered = this.stopRequested;
+    this.stopRequested = false;
     this.starting = false;
-    this.handsfree = handsfree;
+    this.handsfree = handsfree || promptRecovered;
     this.pcmChunks = [];
     this.pcmTotal = 0;
     this.finalTranscript = '';
@@ -350,6 +365,12 @@ export class VoiceController {
     this.vad.reset();
     this.startVadLoop();
     this.armListenGuard();
+
+    if (promptRecovered) {
+      useCatLive
+        .getState()
+        .pushToast(`${useSettings.getState().catName} can hear you now — just talk, no need to hold the mic!`, 'info');
+    }
 
     // optional subtitles via recognition (Engine A audio, Engine B text)
     const wantSubs = useSettings.getState().voice.subtitles;
@@ -363,10 +384,10 @@ export class VoiceController {
       if (this.starting && seq === this.startSeq) {
         this.startSeq++;
         this.starting = false;
-        useCatLive.getState().setLive({
-          micRequesting: false,
-          micError: 'The microphone took too long to start — tap the mic to try again.',
-        });
+        this.stopRequested = false;
+        const msg = 'The microphone took too long to start — tap the mic to try again.';
+        useCatLive.getState().setLive({ micRequesting: false, micError: msg });
+        this.onError?.(msg);
       }
     }, 10000);
   }
@@ -387,29 +408,47 @@ export class VoiceController {
     // ScriptProcessor first (synchronous, gap-free), upgrade to AudioWorklet when ready
     this.setupScriptProcessor(ctx, sink);
     if (ctx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+      if (this.workletState === 'ready') {
+        this.attachWorklet(ctx, sink);
+        return;
+      }
+      if (this.workletState !== 'idle') return; // loading or failed — keep ScriptProcessor
+      this.workletState = 'loading';
       let url = '';
       try {
         url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
       } catch {
-        return; // keep ScriptProcessor
+        this.workletState = 'failed'; // keep ScriptProcessor
+        return;
       }
       ctx.audioWorklet
         .addModule(url)
         .then(() => {
           URL.revokeObjectURL(url);
+          this.workletState = 'ready';
           if (!this.source || this.state !== 'Listening') return;
-          const node = new AudioWorkletNode(ctx, 'mochi-rec');
-          node.port.onmessage = (e: MessageEvent<Float32Array[]>): void => this.onPcm(e.data);
-          this.source.connect(node);
-          node.connect(sink);
-          // swap the fallback out — one tap, not two
-          this.teardownScriptProcessor();
-          this.workletNode = node;
+          this.attachWorklet(ctx, sink);
         })
         .catch(() => {
           URL.revokeObjectURL(url);
+          this.workletState = 'failed';
           /* ScriptProcessor keeps running */
         });
+    }
+  }
+
+  /** one PCM tap via the (already registered) worklet processor */
+  private attachWorklet(ctx: AudioContext, sink: GainNode): void {
+    try {
+      const node = new AudioWorkletNode(ctx, 'mochi-rec');
+      node.port.onmessage = (e: MessageEvent<Float32Array[]>): void => this.onPcm(e.data);
+      this.source?.connect(node);
+      node.connect(sink);
+      // swap the fallback out — one tap, not two
+      this.teardownScriptProcessor();
+      this.workletNode = node;
+    } catch {
+      /* ScriptProcessor keeps running */
     }
   }
 
@@ -518,8 +557,16 @@ export class VoiceController {
   }
 
   async stopListening(): Promise<void> {
-    this.startSeq++; // cancel any start still waiting on the mic
-    this.starting = false;
+    // Still opening the mic? The first-ever getUserMedia can take seconds
+    // (permission prompt / audio device cold start) and the user has already
+    // released the button. Killing the start here made the first echo
+    // attempt fail silently. Remember the release instead and convert the
+    // session to hands-free once the mic actually opens.
+    if (this.starting) {
+      this.stopRequested = true;
+      return;
+    }
+    this.startSeq++;
     if (this.state !== 'Listening') return;
     this.stopVadLoop();
     this.disarmListenGuard();

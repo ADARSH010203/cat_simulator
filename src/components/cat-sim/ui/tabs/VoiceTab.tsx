@@ -8,6 +8,7 @@ import { useCatLive } from '@/store/catStateStore';
 import { voiceController, isTtsSpeakSupported, isSecure } from '../../voice/engines';
 import { runtime } from '../../core/runtime';
 import { Section, Field } from '../controls';
+import { ExternalLink } from 'lucide-react';
 
 const LANGUAGES: Array<{ code: string; label: string }> = [
   { code: 'en-IN', label: 'English (India)' },
@@ -28,6 +29,8 @@ export function VoiceTab(): React.ReactElement {
   const setVoice = useSettings((s) => s.setVoice);
   const permission = useCatLive((s) => s.permission);
   const micError = useCatLive((s) => s.micError);
+  const micBlockedByFrame = useCatLive((s) => s.micBlockedByFrame);
+  const micRequesting = useCatLive((s) => s.micRequesting);
   const ttsSupported = useCatLive((s) => s.ttsSupported);
   const echoState = useCatLive((s) => s.echoState);
   const meterRef = useRef<HTMLDivElement>(null);
@@ -236,21 +239,38 @@ export function VoiceTab(): React.ReactElement {
           <button
             type="button"
             onClick={() => void testMic()}
+            disabled={micRequesting}
             className={`w-full rounded-lg border px-3 py-2 text-xs font-semibold transition ${
               testing
                 ? 'border-rose-300 bg-rose-50 text-rose-600 dark:border-rose-500/40 dark:bg-rose-500/10 dark:text-rose-300'
                 : 'border-stone-200 text-stone-600 hover:bg-stone-50 dark:border-stone-700 dark:text-stone-300 dark:hover:bg-stone-800'
             }`}
           >
-            {testing ? 'Stop test' : 'Test microphone'}
+            {micRequesting ? 'Waking ears…' : testing ? 'Stop test' : 'Test microphone — she will repeat you!'}
           </button>
           {testing && (
             <div className="h-2 w-full overflow-hidden rounded-full bg-stone-100 dark:bg-stone-800">
               <div ref={meterRef} className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-amber-500 transition-[width] duration-75" style={{ width: '8%' }} />
             </div>
           )}
-          {micError && <p className="text-[11px] font-medium text-rose-500">{micError}</p>}
-          {permission === 'denied' && !micError && (
+          {micBlockedByFrame && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-2 dark:border-amber-500/40 dark:bg-amber-500/10">
+              <p className="text-[11px] font-medium leading-relaxed text-amber-800 dark:text-amber-300">
+                This preview window blocks the microphone — browsers only allow it in the top page. Open Mochi in her own
+                tab and echo mode will work.
+              </p>
+              <button
+                type="button"
+                onClick={() => window.open(window.location.href, '_blank', 'noopener')}
+                className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-amber-500 px-2.5 py-1 text-[10px] font-bold text-white shadow transition hover:bg-amber-600"
+              >
+                <ExternalLink className="h-3 w-3" aria-hidden />
+                Open in new tab
+              </button>
+            </div>
+          )}
+          {micError && !micBlockedByFrame && <p className="text-[11px] font-medium text-rose-500">{micError}</p>}
+          {permission === 'denied' && !micError && !micBlockedByFrame && (
             <p className="text-[11px] text-rose-500">
               Microphone permission was denied. You can re-allow it from the address bar — everything else keeps
               working.

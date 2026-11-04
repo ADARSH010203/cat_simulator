@@ -27,6 +27,10 @@ export interface CatLiveState {
   speaking: boolean;
   permission: 'granted' | 'denied' | 'prompt' | 'unsupported';
   micError: string;
+  /** true while getUserMedia is pending (permission prompt / slow device) */
+  micRequesting: boolean;
+  /** cross-origin iframe blocks the mic — offer opening a new tab */
+  micBlockedByFrame: boolean;
   ttsSupported: boolean;
   fps: number;
   lastReactionText: string;
@@ -52,6 +56,8 @@ export const useCatLive = create<CatLiveState>((set) => ({
   speaking: false,
   permission: 'prompt',
   micError: '',
+  micRequesting: false,
+  micBlockedByFrame: false,
   ttsSupported: false,
   fps: 60,
   lastReactionText: '',

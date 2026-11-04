@@ -53,6 +53,11 @@ class CatAudioEngine {
     return s.sound ? s.masterVolume : 0;
   }
 
+  /** effective master volume 0..1 (sound off = 0) — echo playback respects it */
+  effectiveVolume(): number {
+    return this.volume();
+  }
+
   updateVolumes(): void {
     if (this.master) this.master.gain.value = this.volume();
   }
@@ -378,3 +383,8 @@ class CatAudioEngine {
 }
 
 export const catAudio = new CatAudioEngine();
+
+// QA hook: e2e tests can inspect/force the audio context from the console.
+if (typeof window !== 'undefined') {
+  (window as unknown as { __catAudio?: CatAudioEngine }).__catAudio = catAudio;
+}

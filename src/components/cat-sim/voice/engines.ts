@@ -1,8 +1,11 @@
 'use client';
 
 // Talking Echo Mode — two engines, one interface (spec 5.2).
-// Engine A (Recorded): getUserMedia + MediaRecorder, VAD with hysteresis,
-//   playback with playbackRate shift for the classic cat voice.
+// Engine A (Recorded): getUserMedia + AudioWorklet PCM capture (ScriptProcessor
+//   fallback), VAD with hysteresis, playback with playbackRate shift.
+//   Raw PCM capture avoids MediaRecorder codec + decodeAudioData issues
+//   entirely (Safari webm/AAC decode failures, headless quirks, missing
+//   MediaRecorder in some WebViews).
 // Engine B (TTS): SpeechRecognition → SpeechSynthesis, high pitch.
 // Auto: Engine A drives audio + lip-sync; recognition only adds subtitles.
 
@@ -52,16 +55,55 @@ export const isTtsSpeakSupported = (): boolean =>
 export const isSecure = (): boolean =>
   typeof window !== 'undefined' && (window.isSecureContext || location.hostname === 'localhost');
 
+/**
+ * True when the page runs inside a cross-origin iframe — browsers block
+ * getUserMedia there unless the embedder set allow="microphone".
+ * (Preview/hosting wrappers often don't.)
+ */
+export function inCrossOriginIframe(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    if (window.self === window.top) return false;
+    // same-origin iframe? then the top window is reachable
+    void window.top?.location.href;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+// ---------------- AudioWorklet source (raw PCM tap) ----------------
+const WORKLET_SRC = `
+class MochiRecProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._pending = [];
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) {
+      this._pending.push(new Float32Array(ch));
+      if (this._pending.length >= 8) {
+        this.port.postMessage(this._pending);
+        this._pending = [];
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('mochi-rec', MochiRecProcessor);
+`;
+
 // ---------------- VAD ----------------
 class Vad {
-  noiseFloor = 0.008;
+  noiseFloor = 0.006;
   speaking = false;
   speechT0 = 0;
   lastVoiceT = 0;
   startedAt = 0;
 
   reset(): void {
-    this.noiseFloor = 0.008;
+    this.noiseFloor = 0.006;
     this.speaking = false;
     this.speechT0 = 0;
     this.lastVoiceT = 0;
@@ -72,13 +114,13 @@ class Vad {
   update(rms: number, sensitivity: number, now: number): 'none' | 'start' | 'voice' | 'end' {
     // adaptive noise floor (tracks quiet room level)
     if (!this.speaking && rms < this.noiseFloor * 2) {
-      this.noiseFloor = Math.max(0.002, this.noiseFloor * 0.998 + rms * 0.002);
+      this.noiseFloor = Math.max(0.0015, this.noiseFloor * 0.998 + rms * 0.002);
     }
-    const th1 = Math.max(this.noiseFloor * 2.4, 0.015 + (1 - sensitivity) * 0.05);
-    const th0 = th1 * 0.55;
+    const th1 = Math.max(this.noiseFloor * 2.2, 0.01 + (1 - sensitivity) * 0.035);
+    const th0 = th1 * 0.5;
     const elapsed = now - this.startedAt;
 
-    if (!this.speaking && rms > th1 && elapsed > 0.15) {
+    if (!this.speaking && rms > th1 && elapsed > 0.12) {
       this.speaking = true;
       this.speechT0 = now;
       this.lastVoiceT = now;
@@ -88,7 +130,7 @@ class Vad {
       if (rms > th0) this.lastVoiceT = now;
       const silence = now - this.lastVoiceT;
       const voiceLen = this.lastVoiceT - this.speechT0;
-      if (silence > 1.0 && voiceLen >= 0.25) {
+      if (silence > 0.8 && voiceLen >= 0.2) {
         this.speaking = false;
         return 'end';
       }
@@ -98,13 +140,15 @@ class Vad {
       }
       return 'voice';
     }
-    // blips shorter than 0.25 s are ignored by requiring voiceLen above
+    // blips shorter than 0.2 s are ignored by requiring voiceLen above
     return 'none';
   }
 }
 
 // ---------------- controller ----------------
 type Utterance = { kind: 'buffer'; buffer: AudioBuffer } | { kind: 'text'; text: string };
+
+const MAX_CAPTURE_SECONDS = 20;
 
 export class VoiceController {
   state: EchoStateId = 'EchoOff';
@@ -117,10 +161,18 @@ export class VoiceController {
   private stream: MediaStream | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private listenAnalyser: AnalyserNode | null = null;
-  private recorder: MediaRecorder | null = null;
-  private chunks: Blob[] = [];
+  private captureSink: GainNode | null = null;
+  private workletNode: AudioWorkletNode | null = null;
+  private spNode: ScriptProcessorNode | null = null;
+  private pcmChunks: Float32Array[] = [];
+  private pcmTotal = 0;
+  private pcmSampleRate = 0;
+  private starting = false;
+  /** bumped on every stop/cancel — lets a pending start abort cleanly */
+  private startSeq = 0;
   private vad = new Vad();
   private vadTimer: number | null = null;
+  private listenGuard: number | null = null;
   private levelData: Uint8Array<ArrayBuffer> | null = null;
   private recognition: SpeechRecognitionLike | null = null;
   private finalTranscript = '';
@@ -167,105 +219,255 @@ export class VoiceController {
   }
 
   cancelAll(): void {
+    this.startSeq++; // abort any start still waiting on the permission prompt
+    this.starting = false;
     this.stopVadLoop();
+    this.disarmListenGuard();
     this.stopRecognition();
-    if (this.recorder && this.recorder.state !== 'inactive') {
-      try {
-        this.recorder.stop();
-      } catch {
-        /* noop */
-      }
-    }
-    this.recorder = null;
-    this.stopPlayback(true);
+    this.teardownCapture();
     this.releaseMic();
+    this.stopPlayback(true);
     this.handsfree = false;
+    useCatLive.getState().setLive({ micRequesting: false });
   }
 
-  private async getMic(): Promise<MediaStream> {
+  // ---------------- mic ----------------
+
+  private async getMic(retry = true): Promise<MediaStream> {
     if (this.stream) return this.stream;
     const v = useSettings.getState().voice;
     const constraints: MediaStreamConstraints = {
       audio: {
         echoCancellation: true,
-        noiseSuppression: true,
+        // noiseSuppression eats quiet speech — AGC already lifts the level
+        noiseSuppression: false,
         autoGainControl: true,
         ...(v.micId ? { deviceId: { exact: v.micId } } : {}),
       },
     };
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    this.stream = stream;
-    useCatLive.getState().setLive({ permission: 'granted', micError: '' });
-    return stream;
+    useCatLive.getState().setLive({ micRequesting: true });
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      this.stream = stream;
+      useCatLive.getState().setLive({ permission: 'granted', micError: '', micRequesting: false });
+      return stream;
+    } catch (err) {
+      const name = (err as DOMException)?.name ?? '';
+      // a stale device id (mic unplugged) — clear it and retry once with the default mic
+      if (name === 'OverconstrainedError' && v.micId && retry) {
+        useSettings.getState().setVoice({ micId: '' });
+        useCatLive.getState().setLive({ micRequesting: false });
+        return this.getMic(false);
+      }
+      this.handleMicError(name);
+      throw err;
+    }
+  }
+
+  private handleMicError(name: string): void {
+    let permission: 'granted' | 'denied' | 'prompt' | 'unsupported' = 'denied';
+    let micError = 'Could not start the microphone.';
+    let micBlockedByFrame = false;
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      if (inCrossOriginIframe()) {
+        micBlockedByFrame = true;
+        micError = 'This window blocks the microphone — open Mochi in her own tab and she can hear you.';
+      } else if (!isSecure()) {
+        micError = 'Microphone needs HTTPS (or localhost) — the browser blocks it on insecure pages.';
+      } else {
+        micError = 'Microphone permission was denied. Allow it from the address-bar padlock, then tap the mic again.';
+      }
+    } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+      permission = 'unsupported';
+      micError = 'No microphone found on this device.';
+    } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+      micError = 'The microphone is busy in another app — close it and try again.';
+    }
+    useCatLive.getState().setLive({ permission, micError, micBlockedByFrame, micRequesting: false });
   }
 
   private releaseMic(): void {
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
-    this.source?.disconnect();
-    this.source = null;
-    this.listenAnalyser = null;
   }
 
   // ---------------- listening ----------------
 
   async startListening(handsfree: boolean): Promise<void> {
-    if (this.state === 'Listening') return;
+    if (this.state === 'Listening' || this.state === 'Processing' || this.starting) return;
+    this.starting = true;
+    const seq = ++this.startSeq;
+    this.armStartWatchdog(seq);
+
     const ctx = catAudio.ensure();
     if (!ctx) {
+      if (seq === this.startSeq) this.starting = false;
       this.onError?.('Web Audio is not available in this browser.');
       return;
     }
-    if (ctx.state === 'suspended') await ctx.resume().catch(() => undefined);
-
-    try {
-      await this.getMic();
-    } catch (err) {
-      const name = (err as { name?: string }).name ?? '';
-      if (name === 'NotAllowedError' || name === 'SecurityError') {
-        useCatLive.getState().setLive({ permission: 'denied', micError: 'Microphone permission was denied. You can still pet and play with the cat!' });
-      } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
-        useCatLive.getState().setLive({ permission: 'unsupported', micError: 'No microphone found on this device.' });
-      } else if (!isSecure()) {
-        useCatLive.getState().setLive({ permission: 'denied', micError: 'Microphone needs HTTPS or localhost.' });
-      } else {
-        useCatLive.getState().setLive({ micError: 'Could not start the microphone.' });
-      }
+    if (ctx.state === 'suspended') {
+      // never await resume() blindly — outside a user gesture Chrome keeps the
+      // promise pending forever, which would hang the whole echo pipeline
+      await Promise.race([
+        ctx.resume().catch(() => undefined),
+        new Promise<void>((r) => setTimeout(r, 300)),
+      ]);
+    }
+    if (seq !== this.startSeq) {
+      this.starting = false;
       return;
     }
 
+    let stream: MediaStream;
+    try {
+      stream = await this.getMic();
+    } catch {
+      // getMic already surfaced the reason to the UI
+      if (seq === this.startSeq) this.starting = false;
+      return;
+    }
+    if (seq !== this.startSeq) {
+      // cancelled while the permission prompt was open — release and bail
+      stream.getTracks().forEach((t) => t.stop());
+      this.starting = false;
+      return;
+    }
+    if (this.state === 'EchoOff') {
+      // echo was toggled off while the permission prompt was open
+      stream.getTracks().forEach((t) => t.stop());
+      this.starting = false;
+      return;
+    }
+
+    this.starting = false;
     this.handsfree = handsfree;
-    this.chunks = [];
+    this.pcmChunks = [];
+    this.pcmTotal = 0;
     this.finalTranscript = '';
     this.fire('START');
 
-    const c = this.ctx!;
-    this.source = c.createMediaStreamSource(this.stream!);
-    this.listenAnalyser = c.createAnalyser();
-    this.listenAnalyser.fftSize = 512;
-    this.source.connect(this.listenAnalyser);
-    this.levelData = new Uint8Array(this.listenAnalyser.fftSize);
-
-    // recorder with format fallback
-    const preferred = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', ''];
-    const mime = preferred.find((m) => m === '' || MediaRecorder.isTypeSupported(m)) ?? '';
-    try {
-      this.recorder = new MediaRecorder(this.stream!, mime ? { mimeType: mime } : undefined);
-    } catch {
-      this.recorder = new MediaRecorder(this.stream!);
-    }
-    this.recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) this.chunks.push(e.data);
-    };
-    this.recorder.start(120);
-
+    this.setupCapture(ctx, stream);
     this.vad.reset();
-    if (handsfree) this.startVadLoop();
+    this.startVadLoop();
+    this.armListenGuard();
 
     // optional subtitles via recognition (Engine A audio, Engine B text)
     const wantSubs = useSettings.getState().voice.subtitles;
     const usingTts = this.engine === 'tts';
     if (wantSubs || usingTts) this.startRecognition(usingTts);
+  }
+
+  /** if getUserMedia never settles (hung device / OS dialog), unblock after 10 s */
+  private armStartWatchdog(seq: number): void {
+    window.setTimeout(() => {
+      if (this.starting && seq === this.startSeq) {
+        this.startSeq++;
+        this.starting = false;
+        useCatLive.getState().setLive({
+          micRequesting: false,
+          micError: 'The microphone took too long to start — tap the mic to try again.',
+        });
+      }
+    }, 10000);
+  }
+
+  /** source → analyser (levels/VAD) + zero-gain sink pulling the capture node */
+  private setupCapture(ctx: AudioContext, stream: MediaStream): void {
+    this.source = ctx.createMediaStreamSource(stream);
+    this.listenAnalyser = ctx.createAnalyser();
+    this.listenAnalyser.fftSize = 512;
+    this.source.connect(this.listenAnalyser);
+    this.pcmSampleRate = ctx.sampleRate;
+
+    const sink = ctx.createGain();
+    sink.gain.value = 0; // capture only — never feed mic audio to the speakers
+    sink.connect(ctx.destination);
+    this.captureSink = sink;
+
+    // ScriptProcessor first (synchronous, gap-free), upgrade to AudioWorklet when ready
+    this.setupScriptProcessor(ctx, sink);
+    if (ctx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+      let url = '';
+      try {
+        url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
+      } catch {
+        return; // keep ScriptProcessor
+      }
+      ctx.audioWorklet
+        .addModule(url)
+        .then(() => {
+          URL.revokeObjectURL(url);
+          if (!this.source || this.state !== 'Listening') return;
+          const node = new AudioWorkletNode(ctx, 'mochi-rec');
+          node.port.onmessage = (e: MessageEvent<Float32Array[]>): void => this.onPcm(e.data);
+          this.source.connect(node);
+          node.connect(sink);
+          // swap the fallback out — one tap, not two
+          this.teardownScriptProcessor();
+          this.workletNode = node;
+        })
+        .catch(() => {
+          URL.revokeObjectURL(url);
+          /* ScriptProcessor keeps running */
+        });
+    }
+  }
+
+  private setupScriptProcessor(ctx: AudioContext, sink: GainNode): void {
+    if (this.spNode) return;
+    try {
+      const sp = ctx.createScriptProcessor(2048, 1, 1);
+      sp.onaudioprocess = (e: AudioProcessingEvent): void => {
+        if (this.state !== 'Listening') return;
+        this.onPcm([new Float32Array(e.inputBuffer.getChannelData(0))]);
+      };
+      this.source?.connect(sp);
+      sp.connect(sink);
+      this.spNode = sp;
+    } catch {
+      /* no capture path available — stopListening will surface "didn't hear" */
+    }
+  }
+
+  private teardownScriptProcessor(): void {
+    if (this.spNode) {
+      try {
+        this.spNode.onaudioprocess = null;
+        this.spNode.disconnect();
+      } catch {
+        /* noop */
+      }
+      this.spNode = null;
+    }
+  }
+
+  private teardownCapture(): void {
+    this.teardownScriptProcessor();
+    if (this.workletNode) {
+      try {
+        this.workletNode.port.onmessage = null;
+        this.workletNode.disconnect();
+      } catch {
+        /* noop */
+      }
+      this.workletNode = null;
+    }
+    this.source?.disconnect();
+    this.source = null;
+    this.listenAnalyser = null;
+    this.captureSink?.disconnect();
+    this.captureSink = null;
+  }
+
+  private onPcm(chunks: Float32Array[]): void {
+    if (this.state !== 'Listening' || !chunks?.length) return;
+    for (const c of chunks) {
+      this.pcmChunks.push(c);
+      this.pcmTotal += c.length;
+    }
+    if (this.pcmTotal > this.pcmSampleRate * MAX_CAPTURE_SECONDS) {
+      void this.stopListening(); // hard cap — repeat what we have
+    }
   }
 
   private startVadLoop(): void {
@@ -276,12 +478,14 @@ export class VoiceController {
         return;
       }
       const rms = this.readLevel(this.listenAnalyser);
-      runtime.micLevel = rms;
-      const now = performance.now() / 1000;
-      const res = this.vad.update(rms, useSettings.getState().voice.sensitivity, now);
-      if (res === 'end') {
-        void this.stopListening();
-        return;
+      runtime.micLevel = rms; // live ring + test meter, in hold mode too
+      if (this.handsfree) {
+        const now = performance.now() / 1000;
+        const res = this.vad.update(rms, useSettings.getState().voice.sensitivity, now);
+        if (res === 'end') {
+          void this.stopListening();
+          return;
+        }
       }
       this.vadTimer = window.setTimeout(tick, 50);
     };
@@ -295,75 +499,88 @@ export class VoiceController {
     }
   }
 
+  /** hard cap so a missed pointerup can never leave her listening forever */
+  private armListenGuard(): void {
+    this.disarmListenGuard();
+    this.listenGuard = window.setTimeout(
+      () => {
+        if (this.state === 'Listening') void this.stopListening();
+      },
+      MAX_CAPTURE_SECONDS * 1000 + 500,
+    );
+  }
+
+  private disarmListenGuard(): void {
+    if (this.listenGuard !== null) {
+      clearTimeout(this.listenGuard);
+      this.listenGuard = null;
+    }
+  }
+
   async stopListening(): Promise<void> {
+    this.startSeq++; // cancel any start still waiting on the mic
+    this.starting = false;
     if (this.state !== 'Listening') return;
     this.stopVadLoop();
-    const rec = this.recorder;
-    this.recorder = null;
-    const chunks = this.chunks;
-    this.chunks = [];
+    this.disarmListenGuard();
     const c = this.ctx;
+    const chunks = this.pcmChunks;
+    const sampleRate = this.pcmSampleRate;
+    this.pcmChunks = [];
+    this.pcmTotal = 0;
 
-    if (!rec || rec.state === 'inactive' || !c) {
-      this.fire('TIMEOUT');
-      this.releaseMic();
-      return;
-    }
-
-    await new Promise<void>((resolve) => {
-      rec.onstop = () => resolve();
-      try {
-        rec.stop();
-      } catch {
-        resolve();
-      }
-    });
+    this.teardownCapture();
     this.stopRecognition();
     this.releaseMic();
 
-    if (chunks.length === 0) {
+    const total = chunks.reduce((n, ch) => n + ch.length, 0);
+    if (!c || !sampleRate || total < sampleRate * 0.15) {
       this.fire('TIMEOUT');
+      this.nudge('Mochi is listening — hold the mic and speak up a little!');
       return;
     }
     this.fire('END_SPEECH');
 
-    try {
-      const blob = new Blob(chunks, { type: chunks[0].type || 'audio/webm' });
-      const arr = await blob.arrayBuffer();
-      const buffer = await this.decode(c, arr);
-      const trimmed = this.trimSilence(buffer);
-      if (trimmed.duration < 0.25) {
-        this.fire('TIMEOUT');
-        return;
-      }
-      this.lastUtterance = { kind: 'buffer', buffer: trimmed };
-      this.fire('AUDIO_READY');
-      await this.speakLast();
-    } catch {
-      this.onError?.('Could not process that recording — try again.');
-      this.fire('TIMEOUT');
+    const buffer = c.createBuffer(1, total, sampleRate);
+    let off = 0;
+    for (const ch of chunks) {
+      buffer.getChannelData(0).set(ch, off);
+      off += ch.length;
     }
+    const trimmed = this.trimSilence(buffer);
+    if (trimmed.duration < 0.25) {
+      this.fire('TIMEOUT');
+      this.nudge('Mochi didn\u2019t hear anything — try speaking a bit louder.');
+      return;
+    }
+    this.lastUtterance = { kind: 'buffer', buffer: trimmed };
+    this.fire('AUDIO_READY');
+    await this.speakLast();
   }
 
-  private decode(ctx: AudioContext, arr: ArrayBuffer): Promise<AudioBuffer> {
-    return new Promise<AudioBuffer>((resolve, reject) => {
-      const p = ctx.decodeAudioData(arr, resolve, reject);
-      if (p && typeof p.then === 'function') p.then(resolve, reject);
-    });
+  /** gentle, always-visible feedback when an echo round-trip comes back empty */
+  private nudge(text: string): void {
+    useCatLive.getState().pushToast(text, 'info');
+    useCatLive.getState().setLive({ subtitle: text });
   }
 
-  /** Trim leading/trailing quiet parts using a simple RMS gate. */
+  /** Trim leading/trailing quiet parts with a peak-relative RMS gate. */
   private trimSilence(buf: AudioBuffer): AudioBuffer {
     const data = buf.getChannelData(0);
-    const win = Math.floor(buf.sampleRate * 0.02);
-    const th = 0.012;
+    const win = Math.max(1, Math.floor(buf.sampleRate * 0.02));
+    let peak = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const a = Math.abs(data[i]);
+      if (a > peak) peak = a;
+    }
+    const th = Math.min(0.02, Math.max(0.0035, peak * 0.05));
     let first = 0;
     let last = data.length - 1;
     for (let i = 0; i < data.length - win; i += win) {
       let sum = 0;
       for (let k = i; k < i + win; k++) sum += data[k] * data[k];
       if (Math.sqrt(sum / win) > th) {
-        first = i;
+        first = Math.max(0, i - win); // keep a breath before the word
         break;
       }
     }
@@ -371,15 +588,16 @@ export class VoiceController {
       let sum = 0;
       for (let k = i; k < i + win; k++) sum += data[k] * data[k];
       if (Math.sqrt(sum / win) > th) {
-        last = Math.min(data.length - 1, i + win);
+        last = Math.min(data.length, i + win * 2); // and a breath after
         break;
       }
     }
-    if (first === 0 && last === data.length - 1) return buf;
+    if (first === 0 && last >= data.length) return buf;
     const c = this.ctx!;
-    const out = c.createBuffer(buf.numberOfChannels, Math.max(1, last - first), buf.sampleRate);
+    const len = Math.max(1, Math.min(last - first, data.length));
+    const out = c.createBuffer(buf.numberOfChannels, len, buf.sampleRate);
     for (let ch = 0; ch < buf.numberOfChannels; ch++) {
-      out.getChannelData(ch).set(buf.getChannelData(ch).subarray(first, last));
+      out.getChannelData(ch).set(buf.getChannelData(ch).subarray(first, first + len));
     }
     return out;
   }
@@ -423,6 +641,7 @@ export class VoiceController {
           } else {
             this.fire('TIMEOUT');
             this.releaseMic();
+            this.teardownCapture();
           }
         }
       };
@@ -446,7 +665,9 @@ export class VoiceController {
 
   private async stopListeningTts(text: string): Promise<void> {
     this.stopVadLoop();
+    this.disarmListenGuard();
     this.stopRecognition();
+    this.teardownCapture();
     this.releaseMic();
     this.fire('END_SPEECH');
     this.fire('AUDIO_READY');
@@ -502,7 +723,8 @@ export class VoiceController {
       shelf.frequency.value = 3600;
       shelf.gain.value = 3;
       const gain = c.createGain();
-      gain.gain.value = volume;
+      // echo volume × global sound setting — sound off means silence
+      gain.gain.value = volume * catAudio.effectiveVolume();
       const analyser = c.createAnalyser();
       analyser.fftSize = 512;
       src.connect(shelf).connect(gain).connect(analyser).connect(c.destination);
@@ -536,7 +758,7 @@ export class VoiceController {
       u.lang = v.language;
       u.pitch = 1.9; // max is 2 — classic cat voice
       u.rate = Math.min(1.6, Math.max(0.8, v.speed));
-      u.volume = v.volume;
+      u.volume = Math.min(v.volume, catAudio.effectiveVolume() > 0 ? 1 : 0);
       u.onboundary = () => {
         runtime.ttsJaw = 0.85;
       };
@@ -654,3 +876,8 @@ export class VoiceController {
 }
 
 export const voiceController = new VoiceController();
+
+// QA hook: lets e2e tests drive and inspect the echo pipeline from the console.
+if (typeof window !== 'undefined') {
+  (window as unknown as { __voice?: VoiceController }).__voice = voiceController;
+}

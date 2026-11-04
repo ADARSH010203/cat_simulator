@@ -26,7 +26,7 @@ bun test src/lib/__tests__/catSim.test.ts   # state-machine unit tests
 | Transition table (pure) | `src/components/cat-sim/core/stateMachine.ts` | sleep → wake → stretch → stand, never sleep→walk |
 | Gestures + reaction map | `src/components/cat-sim/core/interactions.ts` | tap/double-tap/hold/stroke/poke-spam per body region |
 | Synth audio | `src/components/cat-sim/audio/sounds.ts` | purr (25 Hz AM noise), meow (formant filters), chirp, squeak, bell… |
-| Echo Mode engines | `src/components/cat-sim/voice/engines.ts` | Recorded (exact repeat, any language) + TTS + VAD + lip-sync |
+| Echo Mode engines | `src/components/cat-sim/voice/engines.ts` | Recorded (PCM capture via AudioWorklet, exact repeat, any language) + TTS + VAD + lip-sync |
 | Echo state machine (pure) | `src/components/cat-sim/voice/echoStateMachine.ts` | EchoOff→Idle→Listening→Processing→Speaking→Recover |
 | Environments ×7 | `src/components/cat-sim/environments/` | Garden, Living room, Studio, Bedroom, Forest, Beach, Night sky |
 | Settings store (persisted) | `src/store/settingsStore.ts` | localStorage, schema version + migrate |
@@ -60,6 +60,8 @@ Head/cheek strokes → purr + happy squints · belly tap (high trust, lying down
 
 | Symptom | Fix |
 |---|---|
+| "This window blocks the microphone" | The page is embedded in a frame that doesn't allow the mic — tap **Open in new tab** (next to the mic) and it works |
+| Cat never repeats anything | Make sure the page has HTTPS, tap the mic once (allow the permission), wait for the red *listening* ring, then speak |
 | "Microphone needs HTTPS" | Serve over HTTPS or use `localhost` — browsers block mic on insecure pages |
 | Mic permission denied | Re-allow from the address-bar padlock; the rest of the app keeps working |
 | No sound at all | Click/tap once first — browsers unlock audio only after a user gesture |

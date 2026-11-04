@@ -180,6 +180,12 @@ export class VoiceController {
   private levelData: Uint8Array<ArrayBuffer> | null = null;
   private recognition: SpeechRecognitionLike | null = null;
   private finalTranscript = '';
+  /** one-shot guards so the same warning can't toast-spam every echo */
+  private lastMuteWarn = -1e9;
+  private ttsFallbackWarned = false;
+  /** speech-recognition restart bookkeeping (early error detection) */
+  private srRestarts = 0;
+  private srStartT = 0;
   private playbackAnalyser: AnalyserNode | null = null;
   private playbackSource: AudioBufferSourceNode | null = null;
   private playbackGain: GainNode | null = null;
@@ -211,6 +217,9 @@ export class VoiceController {
     } else {
       this.engine = v.engine;
     }
+    // warm the voice list — Chrome loads speechSynthesis voices lazily and
+    // the first speak() can otherwise race an empty list
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) void window.speechSynthesis.getVoices();
     if (!isSecure()) {
       this.onError?.('Microphone needs HTTPS (or localhost). Echo Mode audio capture is blocked on insecure pages.');
     }
@@ -359,6 +368,7 @@ export class VoiceController {
     this.pcmChunks = [];
     this.pcmTotal = 0;
     this.finalTranscript = '';
+    this.srRestarts = 0;
     this.fire('START');
 
     this.setupCapture(ctx, stream);
@@ -394,16 +404,22 @@ export class VoiceController {
 
   /** source → analyser (levels/VAD) + zero-gain sink pulling the capture node */
   private setupCapture(ctx: AudioContext, stream: MediaStream): void {
-    this.source = ctx.createMediaStreamSource(stream);
-    this.listenAnalyser = ctx.createAnalyser();
-    this.listenAnalyser.fftSize = 512;
-    this.source.connect(this.listenAnalyser);
-    this.pcmSampleRate = ctx.sampleRate;
-
     const sink = ctx.createGain();
     sink.gain.value = 0; // capture only — never feed mic audio to the speakers
     sink.connect(ctx.destination);
     this.captureSink = sink;
+
+    this.source = ctx.createMediaStreamSource(stream);
+    this.listenAnalyser = ctx.createAnalyser();
+    this.listenAnalyser.fftSize = 512;
+    this.source.connect(this.listenAnalyser);
+    // Safari and Firefox only render nodes that are (indirectly) connected to
+    // the destination. A dead-end analyser reads pure silence there, which
+    // kills VAD (hands-free never triggers) and the level ring — the #1
+    // "cat doesn't repeat me" report on those browsers. Route it through the
+    // zero-gain sink so every browser pulls real mic data through it.
+    this.listenAnalyser.connect(sink);
+    this.pcmSampleRate = ctx.sampleRate;
 
     // ScriptProcessor first (synchronous, gap-free), upgrade to AudioWorklet when ready
     this.setupScriptProcessor(ctx, sink);
@@ -520,7 +536,9 @@ export class VoiceController {
       runtime.micLevel = rms; // live ring + test meter, in hold mode too
       if (this.handsfree) {
         const now = performance.now() / 1000;
-        const res = this.vad.update(rms, useSettings.getState().voice.sensitivity, now);
+        // ?? 0.5 guards against a corrupted/partial persisted settings object
+        const sens = useSettings.getState().voice.sensitivity ?? 0.5;
+        const res = this.vad.update(rms, Number.isFinite(sens) ? sens : 0.5, now);
         if (res === 'end') {
           void this.stopListening();
           return;
@@ -583,19 +601,17 @@ export class VoiceController {
     const total = chunks.reduce((n, ch) => n + ch.length, 0);
     if (!c || !sampleRate || total < sampleRate * 0.15) {
       this.fire('TIMEOUT');
-      this.nudge('Mochi is listening — hold the mic and speak up a little!');
+      this.nudge(
+        this.handsfree
+          ? 'Mochi is listening — just speak up a little, she reacts to your voice!'
+          : 'Mochi is listening — hold the mic and speak up a little!',
+      );
       return;
     }
     this.fire('END_SPEECH');
 
-    const buffer = c.createBuffer(1, total, sampleRate);
-    let off = 0;
-    for (const ch of chunks) {
-      buffer.getChannelData(0).set(ch, off);
-      off += ch.length;
-    }
-    const trimmed = this.trimSilence(buffer);
-    if (trimmed.duration < 0.25) {
+    const trimmed = this.assemble(chunks, sampleRate);
+    if (!trimmed) {
       this.fire('TIMEOUT');
       this.nudge('Mochi didn\u2019t hear anything — try speaking a bit louder.');
       return;
@@ -603,6 +619,21 @@ export class VoiceController {
     this.lastUtterance = { kind: 'buffer', buffer: trimmed };
     this.fire('AUDIO_READY');
     await this.speakLast();
+  }
+
+  /** Concat captured PCM into one trimmed buffer; null when too little was said. */
+  private assemble(chunks: Float32Array[], sampleRate: number): AudioBuffer | null {
+    const c = this.ctx;
+    const total = chunks.reduce((n, ch) => n + ch.length, 0);
+    if (!c || !sampleRate || total < sampleRate * 0.15) return null;
+    const buffer = c.createBuffer(1, total, sampleRate);
+    let off = 0;
+    for (const ch of chunks) {
+      buffer.getChannelData(0).set(ch, off);
+      off += ch.length;
+    }
+    const trimmed = this.trimSilence(buffer);
+    return trimmed.duration < 0.25 ? null : trimmed;
   }
 
   /** gentle, always-visible feedback when an echo round-trip comes back empty */
@@ -684,15 +715,35 @@ export class VoiceController {
           const text = this.finalTranscript.trim();
           if (text.length > 0) {
             this.lastUtterance = { kind: 'text', text };
-            void this.stopListeningTts(text);
-          } else {
-            this.fire('TIMEOUT');
-            this.releaseMic();
-            this.teardownCapture();
+            void this.stopListeningTts();
+            return;
           }
+          // empty transcript — if recognition died suspiciously fast it was an
+          // error (offline, no speech service), not the user going quiet: retry
+          // a couple of times before giving up on text
+          const lived = (performance.now() - this.srStartT) / 1000;
+          if (lived < 1.5 && this.srRestarts < 2) {
+            this.srRestarts++;
+            this.startRecognition(forSpeaking);
+            return;
+          }
+          if (this.srRestarts >= 2) {
+            // recognition is broken on this device (offline / blocked) — keep
+            // the session alive: the hold-release / VAD stop will echo the
+            // recording instead. Never kill the mic mid-listen.
+            if (!this.ttsFallbackWarned) {
+              this.ttsFallbackWarned = true;
+              this.onError?.('Speech recognition is unavailable — Mochi will repeat your own voice instead.');
+            }
+            return;
+          }
+          // recognition ended empty after the user had time to speak — echo
+          // the recording instead of leaving the cat mute
+          void this.stopListeningTts();
         }
       };
       rec.start();
+      this.srStartT = performance.now();
       this.recognition = rec;
     } catch {
       this.recognition = null;
@@ -710,23 +761,46 @@ export class VoiceController {
     }
   }
 
-  private async stopListeningTts(text: string): Promise<void> {
+  private async stopListeningTts(): Promise<void> {
     this.stopVadLoop();
     this.disarmListenGuard();
     this.stopRecognition();
+    // keep the recorded take — if this device has no TTS voices (or
+    // recognition understood nothing), playing the recording beats resolving
+    // in silence ("the cat didn't repeat me")
+    const fallback = this.assemble(this.pcmChunks, this.pcmSampleRate);
+    this.pcmChunks = [];
+    this.pcmTotal = 0;
     this.teardownCapture();
     this.releaseMic();
     this.fire('END_SPEECH');
+    if (!this.lastUtterance) {
+      if (!fallback) {
+        this.fire('TIMEOUT');
+        this.nudge('Mochi didn\u2019t hear anything — try speaking a bit louder.');
+        return;
+      }
+      this.lastUtterance = { kind: 'buffer', buffer: fallback };
+    }
     this.fire('AUDIO_READY');
-    await this.speakLast();
+    await this.speakLast(fallback ?? undefined);
   }
 
   // ---------------- speaking ----------------
 
-  async speakLast(): Promise<void> {
+  async speakLast(fallback?: AudioBuffer): Promise<void> {
     const u = this.lastUtterance;
     if (!u) return;
     const v = useSettings.getState().voice;
+    // a muted repeat reads as "the cat is broken" — say it once instead
+    if ((catAudio.effectiveVolume() === 0 || (v.volume ?? 1) === 0) && performance.now() - this.lastMuteWarn > 15000) {
+      this.lastMuteWarn = performance.now();
+      this.onError?.(
+        (v.volume ?? 1) === 0
+          ? 'Mochi is repeating you — but Echo volume is 0! Raise it in the Voice tab.'
+          : 'Mochi is repeating you — but the sound is muted! Turn it on under Animation → Sound.',
+      );
+    }
     // count a successful echo round-trip for the sticker book
     try {
       const { useKid } = await import('@/store/kidStore');
@@ -736,7 +810,7 @@ export class VoiceController {
     }
     const speakFn = async (): Promise<void> => {
       if (u.kind === 'buffer') await this.playBuffer(u.buffer, v.pitch, v.volume);
-      else await this.speakText(u.text, v);
+      else await this.speakText(u.text, v, fallback);
     };
     this.fire('SPEAK_START');
     try {
@@ -754,7 +828,12 @@ export class VoiceController {
     runtime.blinkT0 = runtime.t;
   }
 
-  private playBuffer(buffer: AudioBuffer, rate: number, volume: number): Promise<void> {
+  private async playBuffer(buffer: AudioBuffer, rate: number, volume: number): Promise<void> {
+    const pre = this.ctx;
+    if (pre && pre.state === 'suspended') {
+      // a suspended context "plays" buffers as pure silence — resume first
+      await Promise.race([pre.resume().catch(() => undefined), new Promise<void>((r) => setTimeout(r, 300))]);
+    }
     return new Promise((resolve, reject) => {
       const c = this.ctx;
       if (!c) {
@@ -763,7 +842,10 @@ export class VoiceController {
       }
       const src = c.createBufferSource();
       src.buffer = buffer;
-      src.playbackRate.value = rate;
+      // guards: a corrupted settings blob (undefined pitch/volume) must never
+      // produce NaN params — NaN playbackRate/gain plays pure silence
+      const safeRate = Number.isFinite(rate) && rate > 0 ? rate : 1;
+      src.playbackRate.value = safeRate;
       // gentle high-shelf so the fast voice sounds cute, not harsh
       const shelf = c.createBiquadFilter();
       shelf.type = 'highshelf';
@@ -771,7 +853,8 @@ export class VoiceController {
       shelf.gain.value = 3;
       const gain = c.createGain();
       // echo volume × global sound setting — sound off means silence
-      gain.gain.value = volume * catAudio.effectiveVolume();
+      const safeVol = Number.isFinite(volume) ? volume : 1;
+      gain.gain.value = safeVol * catAudio.effectiveVolume();
       const analyser = c.createAnalyser();
       analyser.fftSize = 512;
       src.connect(shelf).connect(gain).connect(analyser).connect(c.destination);
@@ -795,12 +878,40 @@ export class VoiceController {
     });
   }
 
-  private speakText(text: string, v: { language: string; speed: number; volume: number }): Promise<void> {
-    return new Promise((resolve) => {
-      if (!isTtsSpeakSupported()) {
-        resolve();
-        return;
+  private async speakText(
+    text: string,
+    v: { language: string; speed: number; volume: number; pitch: number },
+    fallback?: AudioBuffer,
+  ): Promise<void> {
+    if (!isTtsSpeakSupported()) {
+      if (fallback) await this.playBuffer(fallback, v.pitch, v.volume);
+      return;
+    }
+    // Chrome/Safari load the voice list lazily — give it a moment before bailing
+    let voices = window.speechSynthesis.getVoices();
+    if (voices.length === 0) {
+      voices = await new Promise<SpeechSynthesisVoice[]>((resolve) => {
+        let done = false;
+        const finish = (): void => {
+          if (done) return;
+          done = true;
+          window.speechSynthesis.onvoiceschanged = null;
+          resolve(window.speechSynthesis.getVoices());
+        };
+        window.speechSynthesis.onvoiceschanged = finish;
+        window.setTimeout(finish, 700);
+      });
+    }
+    if (voices.length === 0) {
+      // no TTS voice on this device — repeat the recording instead of silence
+      if (!this.ttsFallbackWarned) {
+        this.ttsFallbackWarned = true;
+        this.onError?.('No TTS voices on this device — Mochi will repeat your own voice instead.');
       }
+      if (fallback) await this.playBuffer(fallback, v.pitch, v.volume);
+      return;
+    }
+    return new Promise((resolve) => {
       const u = new SpeechSynthesisUtterance(text);
       u.lang = v.language;
       u.pitch = 1.9; // max is 2 — classic cat voice

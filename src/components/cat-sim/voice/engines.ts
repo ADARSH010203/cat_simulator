@@ -836,13 +836,13 @@ export class VoiceController {
           : 'Mochi is repeating you — but the sound is muted! Turn it on under Animation → Sound.',
       );
     }
-    // count a successful echo round-trip for the sticker book
-    try {
-      const { useKid } = await import('@/store/kidStore');
-      useKid.getState().bumpTalk();
-    } catch {
-      /* ignore — kid store is optional */
-    }
+    // count a successful echo round-trip for the sticker book — non-blocking
+    // so the repeat never waits on a chunk load before speaking
+    void import('@/store/kidStore')
+      .then(({ useKid }) => useKid.getState().bumpTalk())
+      .catch(() => {
+        /* ignore — kid store is optional */
+      });
     const speakFn = async (): Promise<void> => {
       if (u.kind === 'buffer') await this.playBuffer(u.buffer, v.pitch, v.volume);
       else await this.speakText(u.text, v, fallback);

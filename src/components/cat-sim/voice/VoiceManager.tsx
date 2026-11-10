@@ -1,9 +1,10 @@
 'use client';
 
-// Echo Mode UI: floating mic button with live level ring + subtitle bubble.
+// Echo Mode UI: two separate buttons — the mic listens/records, the speaker
+// repeats the parked recording — plus the live level ring and subtitle bubble.
 
 import { useEffect, useRef, useState } from 'react';
-import { Mic, MicOff, Square, ExternalLink } from 'lucide-react';
+import { Mic, MicOff, Square, Volume2, VolumeX, ExternalLink } from 'lucide-react';
 import { useSettings } from '@/store/settingsStore';
 import { useCatLive } from '@/store/catStateStore';
 import { voiceController, isTtsSpeakSupported } from './engines';
@@ -17,6 +18,7 @@ export function VoiceManager(): React.ReactElement {
   const subtitle = useCatLive((s) => s.subtitle);
   const micRequesting = useCatLive((s) => s.micRequesting);
   const micBlockedByFrame = useCatLive((s) => s.micBlockedByFrame);
+  const hasRecording = useCatLive((s) => s.hasRecording);
   const ringRef = useRef<HTMLDivElement>(null);
   const holdTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [holdDown, setHoldDown] = useState(false);
@@ -125,54 +127,100 @@ export function VoiceManager(): React.ReactElement {
     }
   };
 
+  /** speaker button — plays the parked recording on demand */
+  const onRepeat = (): void => {
+    catAudio.ensure();
+    if (echoState === 'Speaking') {
+      voiceController.interrupt();
+      return;
+    }
+    void (async (): Promise<void> => {
+      if (!useSettings.getState().voice.echoOn) {
+        useSettings.getState().setVoice({ echoOn: true });
+        await voiceController.enable();
+      }
+      await voiceController.repeat();
+    })();
+  };
+
   const listening = echoState === 'Listening';
   const speaking = echoState === 'Speaking';
   const off = echoState === 'EchoOff';
 
   return (
     <>
-      {/* mic button — sits above the KidBar (left column) so it never gets covered */}
+      {/* mic + speaker — sits above the KidBar (left column) so it never gets covered */}
       <div className="fixed bottom-32 left-4 z-40 md:bottom-[132px] md:left-6">
-        <button
-          type="button"
-          aria-label={listening ? 'Stop listening' : speaking ? 'Stop echo' : 'Start Talking Echo Mode'}
-          onPointerDown={onPointerDown}
-          onPointerUp={onPointerUp}
-          onPointerCancel={stopHold}
-          onPointerLeave={() => {
-            if (holdDown && voice.inputStyle === 'hold') stopHold();
-          }}
-          className={`relative flex h-14 w-14 touch-none select-none items-center justify-center rounded-full shadow-lg transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400 ${
-            listening
-              ? 'bg-rose-500 text-white'
-              : speaking
-                ? 'bg-amber-500 text-white'
-                : micRequesting
-                  ? 'animate-pulse bg-amber-400 text-white'
-                  : off
-                    ? 'bg-white/90 text-stone-700 hover:bg-white'
-                    : 'bg-stone-800 text-amber-300 hover:bg-stone-700'
-          }`}
-        >
-          {(listening || speaking) && (
-            <div
-              ref={ringRef}
-              className="pointer-events-none absolute inset-0 rounded-full border-2 border-rose-400"
-              style={{ transform: 'scale(1)', opacity: 0.5 }}
-            />
-          )}
-          {voice.echoOn ? (
-            listening ? (
-              <Square className="h-5 w-5" aria-hidden />
-            ) : (
-              <Mic className="h-6 w-6" aria-hidden />
-            )
-          ) : (
-            <MicOff className="h-6 w-6" aria-hidden />
-          )}
-        </button>
-        <div className="mt-1 text-center text-[10px] font-medium text-stone-500 dark:text-stone-400">
-          {listening ? 'listening…' : speaking ? `${catName} talks` : micRequesting ? 'waking ears…' : 'Echo'}
+        <div className="flex items-start gap-2.5">
+          {/* ── mic button: listens & records ── */}
+          <div className="flex flex-col items-center">
+            <button
+              type="button"
+              aria-label={listening ? 'Stop listening' : 'Start listening'}
+              onPointerDown={onPointerDown}
+              onPointerUp={onPointerUp}
+              onPointerCancel={stopHold}
+              onPointerLeave={() => {
+                if (holdDown && voice.inputStyle === 'hold') stopHold();
+              }}
+              className={`relative flex h-14 w-14 touch-none select-none items-center justify-center rounded-full shadow-lg transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400 ${
+                listening
+                  ? 'bg-rose-500 text-white'
+                  : micRequesting
+                    ? 'animate-pulse bg-amber-400 text-white'
+                    : off
+                      ? 'bg-white/90 text-stone-700 hover:bg-white dark:bg-stone-700/90 dark:text-stone-200 dark:hover:bg-stone-700'
+                      : 'bg-stone-800 text-amber-300 hover:bg-stone-700 dark:bg-stone-200 dark:text-stone-900 dark:hover:bg-white'
+              }`}
+            >
+              {listening && (
+                <div
+                  ref={ringRef}
+                  className="pointer-events-none absolute inset-0 rounded-full border-2 border-rose-400"
+                  style={{ transform: 'scale(1)', opacity: 0.5 }}
+                />
+              )}
+              {voice.echoOn ? (
+                listening ? (
+                  <Square className="h-5 w-5" aria-hidden />
+                ) : (
+                  <Mic className="h-6 w-6" aria-hidden />
+                )
+              ) : (
+                <MicOff className="h-6 w-6" aria-hidden />
+              )}
+            </button>
+            <div className="mt-1 text-center text-[10px] font-medium text-stone-500 dark:text-stone-400">
+              {listening ? 'listening…' : micRequesting ? 'waking ears…' : off ? 'Mic' : 'Listen'}
+            </div>
+          </div>
+
+          {/* ── speaker button: repeats the recording ── */}
+          <div className="flex flex-col items-center">
+            <button
+              type="button"
+              aria-label={speaking ? 'Stop repeating' : hasRecording ? 'Repeat what I said' : 'Repeat — record something first'}
+              onClick={onRepeat}
+              className={`relative flex h-14 w-14 touch-none select-none items-center justify-center rounded-full shadow-lg transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400 ${
+                speaking
+                  ? 'animate-pulse bg-amber-500 text-white'
+                  : hasRecording
+                    ? 'bg-emerald-600 text-white hover:bg-emerald-500'
+                    : 'bg-white/70 text-stone-400 hover:bg-white/90 dark:bg-stone-700/70 dark:text-stone-500 dark:hover:bg-stone-700'
+              }`}
+            >
+              {speaking ? (
+                <Square className="h-5 w-5" aria-hidden />
+              ) : hasRecording ? (
+                <Volume2 className="h-6 w-6" aria-hidden />
+              ) : (
+                <VolumeX className="h-6 w-6" aria-hidden />
+              )}
+            </button>
+            <div className="mt-1 text-center text-[10px] font-medium text-stone-500 dark:text-stone-400">
+              {speaking ? `${catName} talks` : 'Repeat'}
+            </div>
+          </div>
         </div>
         {micBlockedByFrame && (
           <button

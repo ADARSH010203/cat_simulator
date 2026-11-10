@@ -183,6 +183,10 @@ export class VoiceController {
   /** one-shot guards so the same warning can't toast-spam every echo */
   private lastMuteWarn = -1e9;
   private ttsFallbackWarned = false;
+  /** recording to fall back to when a TTS repeat has no voices */
+  private lastFallback: AudioBuffer | null = null;
+  /** one-time hint after the first deferred recording */
+  private deferHintShown = false;
   /** speech-recognition restart bookkeeping (early error detection) */
   private srRestarts = 0;
   private srStartT = 0;
@@ -617,8 +621,21 @@ export class VoiceController {
       return;
     }
     this.lastUtterance = { kind: 'buffer', buffer: trimmed };
-    this.fire('AUDIO_READY');
-    await this.speakLast();
+    this.lastFallback = null;
+    this.markRecorded();
+  }
+
+  /** Recording captured — park it on the Repeat button instead of playing it
+   *  straight away. The mic and the playback are two separate buttons now. */
+  private markRecorded(): void {
+    this.fire('DEFER');
+    useCatLive.getState().setLive({ hasRecording: true });
+    if (!this.deferHintShown) {
+      this.deferHintShown = true;
+      useCatLive
+        .getState()
+        .pushToast(`Got it! Tap the speaker button and ${useSettings.getState().catName} will repeat you.`, 'success');
+    }
   }
 
   /** Concat captured PCM into one trimmed buffer; null when too little was said. */
@@ -782,11 +799,29 @@ export class VoiceController {
       }
       this.lastUtterance = { kind: 'buffer', buffer: fallback };
     }
-    this.fire('AUDIO_READY');
-    await this.speakLast(fallback ?? undefined);
+    this.lastFallback = this.lastUtterance.kind === 'text' ? fallback : null;
+    this.markRecorded();
   }
 
   // ---------------- speaking ----------------
+
+  /** Repeat button — play back the last recording on demand. */
+  async repeat(): Promise<void> {
+    if (this.starting) return; // mic is still opening — nothing to do yet
+    if (this.state === 'Speaking') {
+      this.interrupt(); // second tap while repeating = stop
+      return;
+    }
+    if (this.state === 'Listening') {
+      // pressed while still recording — close the take, then play it
+      await this.stopListening();
+    }
+    if (!this.lastUtterance) {
+      this.nudge(`${useSettings.getState().catName} hasn't heard anything yet — tap the mic button and speak first!`);
+      return;
+    }
+    await this.speakLast(this.lastFallback ?? undefined);
+  }
 
   async speakLast(fallback?: AudioBuffer): Promise<void> {
     const u = this.lastUtterance;

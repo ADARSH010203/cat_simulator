@@ -34,7 +34,8 @@ const FUN_CARDS: Card[] = [
     title: 'Talk to her',
     lines: [
       'Open the Voice tab and turn on Echo Mode.',
-      'Hold the mic, speak, let go — she repeats in a tiny cat voice.',
+      'Tap the mic and speak — she records what you say.',
+      'Then tap the speaker button — she repeats it in a tiny cat voice!',
       'Works in any language!',
       'Add a meow at the end for fun.',
     ],

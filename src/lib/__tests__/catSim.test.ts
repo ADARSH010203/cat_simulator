@@ -31,6 +31,22 @@ describe('echo state machine', () => {
     expect(nextEchoState('Processing', 'AUDIO_READY')).toBe('Speaking');
   });
 
+  test('recording defers playback back to idle (mic & speaker are separate)', () => {
+    let s = nextEchoState('EchoOff', 'ENABLE');
+    s = nextEchoState(s, 'START');
+    s = nextEchoState(s, 'END_SPEECH');
+    expect(s).toBe('Processing');
+    s = nextEchoState(s, 'DEFER');
+    expect(s).toBe('EchoIdle');
+  });
+
+  test('repeat button starts speaking from idle and recover', () => {
+    expect(nextEchoState('EchoIdle', 'SPEAK_START')).toBe('Speaking');
+    expect(nextEchoState('Recover', 'SPEAK_START')).toBe('Speaking');
+    // already speaking — no state change, no crash
+    expect(nextEchoState('Speaking', 'SPEAK_START')).toBe('Speaking');
+  });
+
   test('speaking → recover when done or interrupted', () => {
     expect(nextEchoState('Speaking', 'SPEAK_END')).toBe('Recover');
     expect(nextEchoState('Speaking', 'INTERRUPT')).toBe('Recover');

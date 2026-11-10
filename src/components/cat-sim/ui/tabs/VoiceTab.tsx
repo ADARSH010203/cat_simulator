@@ -72,13 +72,18 @@ export function VoiceTab(): React.ReactElement {
     if (testing) {
       setTesting(false);
       if (voiceController.state === 'Listening') await voiceController.stopListening();
+      if (voiceController.lastUtterance) await voiceController.repeat();
       return;
     }
     setTesting(true);
     await voiceController.startListening(false);
-    // hold-mode test: stop after 4 s automatically
+    // hold-mode test: stop after 4 s and play the take back automatically
     setTimeout(() => {
-      if (voiceController.state === 'Listening') void voiceController.stopListening();
+      if (voiceController.state === 'Listening') {
+        void voiceController.stopListening().then(() => {
+          if (voiceController.lastUtterance) void voiceController.repeat();
+        });
+      }
     }, 4000);
   };
 
@@ -121,7 +126,8 @@ export function VoiceTab(): React.ReactElement {
         </Field>
         <p className="rounded-lg bg-stone-50 p-2 text-[10px] leading-relaxed text-stone-500 dark:bg-stone-800/60 dark:text-stone-400">
           <strong>Recorded</strong> replays your own recording with a higher, cuter pitch — words stay exactly the
-          same in any language. <strong>TTS</strong> re-speaks the recognised text in a high-pitch voice.
+          same in any language. Tap the mic to record, then the speaker button to hear her repeat.{' '}
+          <strong>TTS</strong> re-speaks the recognised text in a high-pitch voice.
           {!isSecure() && <span className="mt-1 block text-rose-500">⚠ This page is not HTTPS — the microphone will be blocked by the browser.</span>}
         </p>
       </Section>

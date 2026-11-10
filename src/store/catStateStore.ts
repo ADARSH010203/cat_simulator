@@ -32,6 +32,8 @@ export interface CatLiveState {
   /** cross-origin iframe blocks the mic — offer opening a new tab */
   micBlockedByFrame: boolean;
   ttsSupported: boolean;
+  /** a finished recording is parked and the Repeat button can play it */
+  hasRecording: boolean;
   fps: number;
   lastReactionText: string;
   toasts: Toast[];
@@ -59,6 +61,7 @@ export const useCatLive = create<CatLiveState>((set) => ({
   micRequesting: false,
   micBlockedByFrame: false,
   ttsSupported: false,
+  hasRecording: false,
   fps: 60,
   lastReactionText: '',
   toasts: [],
